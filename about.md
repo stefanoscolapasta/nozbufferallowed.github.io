@@ -3,7 +3,7 @@ layout: page
 title: About
 ---
 
-<img src="/assets/head_scan.png" alt="Stefano Scolari" style="max-width: 220px; border-radius: 6px;">
+<img src="{{ '/assets/head_scan.png' | relative_url }}" alt="Stefano Scolari" style="max-width: 220px; border-radius: 6px;">
 
 I'm Stefano Scolari, a graphics researcher and engineer. My interests and passions lay at the intersection of differentiable and neural rendering, ML and gpu optimization.
 
