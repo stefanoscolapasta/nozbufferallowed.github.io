@@ -2,7 +2,7 @@
 
 ## A great local optima
 
-I've been working on 3DGS for a while at this point, while at EA I spent a lot of time optimizing what we'd call the forward (fwd) part of the pipeline. If you want to ship splats on consumer hardware (for whatever reason), that's what you should, at least initially, care about.<br>
+I've been working on 3DGS for almost 3 years at this point, while at EA I spent a lot of time optimizing what we'd call the forward (fwd) part of the pipeline, er the rasterization of the primitive. If you want to ship splats on consumer hardware (for whatever reason), that's what you should, at least initially, care about.<br>
 Last year though, I started prototyping some stuff in GIGI (great framework to experiment with GFX programming techniques at the speed of light, thank you Alan, its an amazing piece of software). I had heard about Slang, so I decided to prototype a 2d gaussian trainer in it.<br>
 Coming from the GFX world, I was slightly averse to the pytorch environment, and having parts of the optimization process "hidden" behind the its machinery was slowing me down in understanding the whole things. I went through the TinyDiffRast tutorial course to get a better grip on how differentiable rendering (rasterization in particular) works, and walked my way from there. Also, once you'll get to the RasterizeThenSplat section of it, the reason why 3DGS just makes sense, should also click for you.<br>
 Long story short, I've been reading many papers on 3DGS, and while focusing on optimizing the hell out of the pure rasterization part of it was fun, it left me wanting to reinvent the weel, which degenerated in me thinking I could write the fastest available gradient-based 3DGS trainer. <br>
@@ -30,7 +30,56 @@ Avoiding the tip-tooeing approach to densification shows how many steps in the o
 
 
 ### Pure gpu optimization
-If you try implementing the backward pass naively and benchmark a training step, you'll quickly realize you are most likely 80/90% bwd pass bound. This is due to the incredibly high atomic contention you're subjecting your poor gpu too. In a naive implementation each work group maps to a tile, so each thread in a WG maps to a pixel, each thread then accesses the its splats via an index buffer given the tile id. Each thread is computing the gradients for the same splat and via an atomicAdd accumulating to main memory. You can image how bad having 256 (16x16) atomicAdds into the same buffer slot can be. [How many cycles is that stalling for?].
+If you try implementing the backward pass naively and benchmark a training step, you'll quickly realize you are most likely 80/90% bwd pass bound. I you run a gpu trace, you'll see how the main bottleneck is atomic contention -> a bunch of long scoreboards. This is due to the incredibly high atomic contention you're subjecting your poor gpu too. In a naive implementation, each work group maps to a tile, and each thread in a WG maps to a pixel. Each thread then accesses its splats via an index buffer given the tile id.<br>
+Imagine a tile has 10 splats binned to it, meaning during the projection phase we identified these 10 to be the splats that influence any pixel of it. It makes sense to have each thread in your thread group map to a pixel of the tile, in parallel compute the per-pixel gradients for each parameter given the per-pixel loss and then atomically add each gradient value into the gradient buffers (where each idx **n** within it maps to splat **n**). So we're saying that we have 256 (16x16) threads atomically hammering 14+ buffers each into the same slot **n**. We can agree that while mentally simpler to parallely map the problem this way, it's not great.<br>
+I'd be happy if each tile would actually contain 10 splats, but its often unfortunately 1-2 orders of magnitude higher. Some tiles from certain camera views can have binned in them 10000k splats, and even after filtering out splats that do not contribute to the final pixel as Transmittance fell below a certain threshold way before them, we may need to blend 1-3k splats in order to reach it (this also raises a question for: damn do we actually need to blend 3000 splats for a single pixel in order to a) get the correct final color b) correctly let the gradient and optimization flow c) look around, 90% of what you see is mostly opaque anyway...). Just hinting at where I think the optima for rendering splats is, even though we are here talking about a primary visibility problem: What's better? Clustered or tiled shading? I'd go with the former :) <br>
+Anyhow, we agree that having our loop be:
+
+```
+(within each tile)
+for each splat: <---- each thread has a loop over each splat within this tile
+    for each pixel: <---- each thread gets assigned to a px
+        compute or load ppx loss
+        compute chain rule and gradient for each parameter
+        atomicAdd(buff_grad_forWhateverParamThis1, gradForWhateverParamThis_asInt)
+        atomicAdd(buff_grad_forWhateverParamThis2, gradForWhateverParamThis_asInt)
+        ...
+        atomicAdd(buff_grad_forWhateverParamThisN, gradForWhateverParamThis_asInt)
+
+```
+
+is not great. You could think of accumulating each gradient in groupshared memory first, but the atomic contention is still there. You can try, it wont make a difference.
+What if we flipped the problem though?
+What if we parallelized over each splat within each tile? That's interesting!
+So our loop would become:
+
+```
+(within each tile)
+for each pixel: <---- each thread has a loop over each pixel within this tile
+    int totalGradForWhateverParamThis1 = 0
+    int totalGradForWhateverParamThis2 = 0
+    ...
+    int totalGradForWhateverParamThisN = 0
+
+    for each splat: <---- each thread gets assigned to a splat
+        compute or load ppx loss
+        compute chain rule and gradient for each parameter
+        totalGradForWhateverParamThis1 += gradForWhateverParamThis1_asInt
+        totalGradForWhateverParamThis2 += gradForWhateverParamThis2_asInt
+        ...
+        totalGradForWhateverParamThisN += gradForWhateverParamThisM_asInt
+
+    atomicAdd(buff_grad_forWhateverParamThis1, totalGradForWhateverParamThis1)
+    atomicAdd(buff_grad_forWhateverParamThis2, totalGradForWhateverParamThis2)
+    ...
+    atomicAdd(buff_grad_forWhateverParamThisN, totalGradForWhateverParamThisN)
+
+```
+
+Hey we just traded ALU and some register pressure to save a ton of atomics!<br>
+Another trick -> in order to compute the transmittance at each splat, you need the transmittance from each splat in front of it.
+Well, assuming our wave size is 32 (64 on AMD hw), during our forward pass we can store some "checkpoints". Meaning that every 32nd blended splat, we store the intermediate color and opacity (1-T). By doing this, we can create a set of **buckets**. Why? So whenever we need the transmittance value for a given splat, we can just compute it via a fast wave-intrinsic operation: waveprefixproduct(T) :O
+We keep everything in registers, have a single atomic reduction per wave and bam: we reduced (per tile though, because splats can end up in multiple tiles) the atomic contention to 0. We saved thousands of idle cycles in favour of more ALU work, which GPUs are pretty good at now :D
 
 ### Sorting
 I ported the excellent gpu radix sort HLSL implementation by b0nes to slang, and sorting has always stayed well below the 1.5ms for me. Given that on larger scenes with 5-7mln splats the fwd pass (binning, prefix scans, fwd rasterize) can account to 7/8ms and the bwd pass can take up to 13ms, over-optimizing the sorting part is not really going to yield you much of win. Hell, my non-separable-and-definitely-not-too-well-optimizined SSIM pass is taking more than the radix sort at the moment... so I dont really see a great appeal for stochastic transparency approaches at the moment, given that they usually yield noisier gradient optimization and slower convergence, it does not really help me reach my goal (Ideally I'd like to reach 26db in 100 seconds on a 16gb 4080 card, but I dont shy away from the fact that I'm sure this can be somehow achieved in 10 seconds, I know it can...). </br>
